@@ -21,10 +21,5 @@
 	./compute_lgu.sh
 	```
 
-5. For experiment reproduction (OpenAI API required), you can directly use precomputed results in:
-	```
-	result/10_answer
-	```
-
-6. Analyze results:
+5. Analyze results:
 	- Run notebooks in the `notebooks` folder for further analysis.
