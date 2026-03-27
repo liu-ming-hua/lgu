@@ -29,7 +29,7 @@ from uncertainty.uncertainty_measures import p_true as p_true_utils
 
 import kle
 from uncertainty.uncertainty_measures.baseline import mean_token_entropy, maximum_sequence_probability, perplexity, avg_entropy, max_entropy, avg_neg_logp, max_neg_logp
-from LGE.semantic_uncertainty.uncertainty.uncertainty_measures.logical_graph import *
+from uncertainty.uncertainty_measures.logical_graph import *
 
 
 
