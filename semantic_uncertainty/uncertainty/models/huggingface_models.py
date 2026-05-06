@@ -92,16 +92,26 @@ class HuggingfaceModel(BaseModel):
 
         if stop_sequences == 'default':
             stop_sequences = STOP_SEQUENCES
+        elif stop_sequences is None:
+            stop_sequences = []
 
         if 'llama' in model_name.lower():
             if model_name.endswith('-8bit'):
                 kwargs = {'quantization_config': BitsAndBytesConfig(
                     load_in_8bit=True,)}
                 model_name = model_name[:-len('-8bit')]
-                eightbit = True
+                quantized = True
+            elif model_name.endswith('-4bit'):
+                kwargs = {'quantization_config': BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type='nf4',)}
+                model_name = model_name[:-len('-4bit')]
+                quantized = True
             else:
                 kwargs = {}
-                eightbit = False
+                quantized = False
 
             if 'Llama-2' in model_name or "Llama-3" in model_name:
                 base = 'meta-llama'
@@ -117,7 +127,7 @@ class HuggingfaceModel(BaseModel):
             llama65b = '65b' in model_name and base == 'huggyllama'
             llama2_70b = '70b' in model_name and base == 'meta-llama'
 
-            if ('7b' in model_name or "8B" in model_name or '13b' in model_name) or eightbit:
+            if ('7b' in model_name or "8B" in model_name or '13b' in model_name) or quantized:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     f"{base}/{model_name}", device_map="auto",
                     max_memory={0: '20GIB', 1: '20GIB', 2: '20GIB', 3: '20GIB'}, **kwargs,)
@@ -156,7 +166,7 @@ class HuggingfaceModel(BaseModel):
                 kwargs = {'quantization_config': BitsAndBytesConfig(
                     load_in_8bit=True,)}
                 model_name = model_name[:-len('-8bit')]
-            if model_name.endswith('-4bit'):
+            elif model_name.endswith('-4bit'):
                 kwargs = {'quantization_config': BitsAndBytesConfig(
                     load_in_4bit=True,)}
                 model_name = model_name[:-len('-4bit')]
@@ -214,19 +224,53 @@ class HuggingfaceModel(BaseModel):
                 max_memory={0: '22GIB', 1: '22GIB', 2: '22GIB', 3: '22GIB'},
                 **kwargs
             )
+
+        elif 'gemma' in model_name.lower():
+            if model_name.endswith('-8bit'):
+                kwargs = {'quantization_config': BitsAndBytesConfig(
+                    load_in_8bit=True,)}
+                model_name = model_name[:-len('-8bit')]
+            elif model_name.endswith('-4bit'):
+                kwargs = {'quantization_config': BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type='nf4',)}
+                model_name = model_name[:-len('-4bit')]
+            else:
+                kwargs = {}
+
+            model_id = f'google/{model_name}'
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_id, device_map='auto', token_type_ids=None,
+                clean_up_tokenization_spaces=False)
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                device_map='auto',
+                max_memory={0: '20GIB', 1: '20GIB', 2: '20GIB', 3: '20GIB'},
+                **kwargs,
+            )
+
         else:
             raise ValueError
 
         self.model_name = model_name
         self.stop_sequences = stop_sequences + [self.tokenizer.eos_token]
-        self.token_limit = 4096 if 'Llama-2' in model_name or "Llama-3" in model_name else 2048
+        model_name_lower = model_name.lower()
+        if 'llama-2' in model_name_lower or 'llama-3' in model_name_lower:
+            self.token_limit = 4096
+        elif 'gemma' in model_name_lower:
+            self.token_limit = 8192
+        else:
+            self.token_limit = 2048
 
     def predict(self, input_data, temperature, return_full=False):
 
         # Implement prediction.
         inputs = self.tokenizer(input_data, return_tensors="pt").to("cuda")
 
-        if 'llama' in self.model_name.lower() or 'falcon' in self.model_name or 'mistral' in self.model_name.lower():
+        if 'llama' in self.model_name.lower() or 'falcon' in self.model_name or 'mistral' in self.model_name.lower() or 'gemma' in self.model_name.lower():
             if 'token_type_ids' in inputs:  # Some HF models have changed.
                 del inputs['token_type_ids']
             pad_token_id = self.tokenizer.eos_token_id
@@ -261,11 +305,14 @@ class HuggingfaceModel(BaseModel):
                 'Generation exceeding token limit %d > %d',
                 len(outputs.sequences[0]), self.token_limit)
 
+        n_input_token = len(inputs['input_ids'][0])
+        generated_token_ids = outputs.sequences[0][n_input_token:]
         full_answer = self.tokenizer.decode(
             outputs.sequences[0], skip_special_tokens=True)
+        answer = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
         
         if 'qwen' in self.model_name.lower():
-            output_ids = outputs.sequences[0].tolist()
+            output_ids = generated_token_ids.tolist()
             try:
                 # 查找特殊标记 </think> 的位置
                 think_end_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
@@ -275,34 +322,30 @@ class HuggingfaceModel(BaseModel):
 
             # 解码 "think" 和实际内容
             thinking_content = self.tokenizer.decode(output_ids[:index], skip_special_tokens=True).strip("\n")
-            full_answer = self.tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n")
+            answer = self.tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n")
 
         if return_full:
             return full_answer
-
-        # For some models, we need to remove the input_data from the answer.
-        if full_answer.startswith(input_data):
-            input_data_offset = len(input_data)
-        else:
-            #raise ValueError('Have not tested this in a while.')
-            logging.error(f"Full answer should start from input_data. Setting input_data offset to 0")
-            logging.error(f"Full answer is {full_answer}")
-            logging.error(f"Input data is {input_data}")
-            input_data_offset = 0
-
-        # Remove input from answer.
-        answer = full_answer[input_data_offset:]
 
         # Remove stop_words from answer.
         stop_at = len(answer)
         sliced_answer = answer
         if self.stop_sequences is not None:
-            for stop in self.stop_sequences:
-                if answer.endswith(stop):
-                    stop_at = len(answer) - len(stop)
-                    sliced_answer = answer[:stop_at]
+            # Repeatedly strip trailing stop sequences to handle overlaps like
+            # '\n\n\n\n' + '\n' that can appear in a single generation.
+            while True:
+                matched = False
+                for stop in self.stop_sequences:
+                    if stop and sliced_answer.endswith(stop):
+                        stop_at -= len(stop)
+                        sliced_answer = sliced_answer[:-len(stop)]
+                        matched = True
+                        break
+                if not matched:
                     break
-            if not all([stop not in sliced_answer for stop in self.stop_sequences]):
+
+            # Keep a strict sanity check only for trailing stop sequences.
+            if any(stop and sliced_answer.endswith(stop) for stop in self.stop_sequences):
                 error_msg = 'Error: Stop words not removed successfully!'
                 error_msg += f'Answer: >{answer}< '
                 error_msg += f'Sliced Answer: >{sliced_answer}<'
@@ -319,9 +362,7 @@ class HuggingfaceModel(BaseModel):
         # Note: It's important we do this with full answer, since there might be
         # non-trivial interactions between the input_data and generated part
         # in tokenization (particularly around whitespaces.)
-        token_stop_index = self.tokenizer(full_answer[:input_data_offset + stop_at], return_tensors="pt")['input_ids'].shape[1]
-        n_input_token = len(inputs['input_ids'][0])
-        n_generated = token_stop_index - n_input_token
+        n_generated = self.tokenizer(answer[:stop_at], return_tensors="pt")['input_ids'].shape[1]
 
         if n_generated == 0:
             logging.warning('Only stop_words were generated. For likelihoods and embeddings, taking stop word instead.')
@@ -338,8 +379,8 @@ class HuggingfaceModel(BaseModel):
         #    (n_layers) x (batch_size, 1, hidden_size).
 
         # Note: The output embeddings have the shape (batch_size, generated_length, hidden_size).
-        # We do not get embeddings for input_data! We thus subtract the n_tokens_in_input from
-        # token_stop_index to arrive at the right output.
+        # We do not get embeddings for input_data! We thus use n_generated
+        # to index the generated hidden states directly.
 
         if 'decoder_hidden_states' in outputs.keys():
             hidden = outputs.decoder_hidden_states
@@ -349,9 +390,9 @@ class HuggingfaceModel(BaseModel):
         if len(hidden) == 1:
             logging.warning(
                 'Taking first and only generation for hidden! '
-                'n_generated: %d, n_input_token: %d, token_stop_index %d, '
+                'n_generated: %d, n_input_token: %d, '
                 'last_token: %s, generation was: %s',
-                n_generated, n_input_token, token_stop_index,
+                n_generated, n_input_token,
                 self.tokenizer.decode(outputs['sequences'][0][-1]),
                 full_answer,
                 )
@@ -360,9 +401,9 @@ class HuggingfaceModel(BaseModel):
             # If access idx is larger/equal.
             logging.error(
                 'Taking last state because n_generated is too large'
-                'n_generated: %d, n_input_token: %d, token_stop_index %d, '
+                'n_generated: %d, n_input_token: %d, '
                 'last_token: %s, generation was: %s, slice_answer: %s',
-                n_generated, n_input_token, token_stop_index,
+                n_generated, n_input_token,
                 self.tokenizer.decode(outputs['sequences'][0][-1]),
                 full_answer, sliced_answer
                 )
